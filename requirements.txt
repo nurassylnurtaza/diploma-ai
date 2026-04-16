@@ -3,4 +3,5 @@ uvicorn[standard]
 joblib
 numpy
 scikit-learn
-
+torch
+transformers

@@ -1,24 +1,16 @@
-from __future__ import annotations
-
 import os
+import torch
 import threading
-from dataclasses import dataclass
+import torch.nn.functional as F
+
 from pathlib import Path
-from typing import Any
-
-import joblib
-import numpy as np
+from dataclasses import dataclass
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 
-@dataclass(frozen=True)
-class ModelOutput:
-    score: float
-    confidence: float
+LABELS = ["Anxiety", "Depression", "Normal", "Suicidal"]
 
-
-DEFAULT_CLASS_RISK_SCORE: dict[str, float] = {
-    # Default mapping for the included mental-health multiclass model.
-    # Produces a continuous score in [0..1] that is later mapped to low/medium/high.
+RISK_MAP = {
     "Normal": 0.0,
     "Anxiety": 0.6,
     "Depression": 0.85,
@@ -26,151 +18,67 @@ DEFAULT_CLASS_RISK_SCORE: dict[str, float] = {
 }
 
 
+@dataclass
+class ModelOutput:
+    label: str
+    score: float
+    confidence: float
+
+
 class ModelStore:
-    def __init__(self, models_dir: str, default_version: str) -> None:
-        self._models_dir = Path(models_dir)
-        self._default_version = default_version
+    def __init__(self):
+        self.models_dir = Path(os.getenv("MODELS_DIR", "./models"))
+        self.default_version = os.getenv("DEFAULT_MODEL_VERSION", "mentalbert-v1")
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self._model = None
+        self._tokenizer = None
         self._lock = threading.Lock()
-        self._models: dict[str, Any] = {}
 
-    @property
-    def default_version(self) -> str:
-        return self._default_version
-
-    def try_warmup(self) -> None:
-        # Best-effort warmup; service still works without model files.
-        try:
-            self.get_model(self._default_version)
-        except Exception:
-            return
-
-    def model_path(self, version: str) -> Path:
-        version = (version or "").strip() or self._default_version
-        return self._models_dir / f"{version}.joblib"
-
-    def get_model(self, version: str) -> Any | None:
-        version = (version or "").strip() or self._default_version
+    def load_model(self):
         with self._lock:
-            if version in self._models:
-                return self._models[version]
+            if self._model is not None:
+                return
 
-            path = self.model_path(version)
+            path = self.models_dir / self.default_version
+
             if not path.exists():
-                self._models[version] = None
-                return None
+                raise ValueError(f"Model not found at {path}")
 
-            m = joblib.load(path)
-            self._models[version] = m
-            return m
+            self._tokenizer = AutoTokenizer.from_pretrained(path)
+            self._model = AutoModelForSequenceClassification.from_pretrained(path)
 
-    def infer(self, text: str, model_version: str) -> ModelOutput | None:
-        model = self.get_model(model_version)
-        if model is None:
-            return None
+            self._model.to(self.device)
+            self._model.eval()
 
-        classes = self._safe_classes_list(getattr(model, "classes_", None))
-
-        # sklearn-style APIs (best compatibility).
-        if hasattr(model, "predict_proba"):
-            proba = model.predict_proba([text])[0]
-            proba = np.asarray(proba, dtype=float)
-            if proba.ndim != 1 or proba.size == 0:
-                return None
-
-            if classes and len(classes) == int(proba.size):
-                score = float(self._risk_score_from_classes(classes, proba))
-            else:
-                score = float(self._pick_positive_probability(model, proba))
-            confidence = float(np.max(proba))
-            return ModelOutput(score=score, confidence=confidence)
-
-        if hasattr(model, "decision_function"):
-            margins = np.asarray(model.decision_function([text]), dtype=float)
-
-            # Binary case: margin scalar -> sigmoid.
-            if margins.ndim == 1 and margins.size == 1:
-                margin = float(margins.reshape(-1)[0])
-                score = float(1.0 / (1.0 + np.exp(-margin)))
-                confidence = float(max(score, 1.0 - score))
-                return ModelOutput(score=score, confidence=confidence)
-
-            # Multiclass: margins vector -> softmax (not calibrated, but usable for confidence/weights).
-            margins = margins.reshape(1, -1) if margins.ndim == 1 else margins
-            if margins.ndim != 2 or margins.shape[0] != 1 or margins.shape[1] == 0:
-                return None
-
-            probs = self._softmax(margins[0])
-            confidence = float(np.max(probs))
-
-            if classes and len(classes) == int(probs.size):
-                score = float(self._risk_score_from_classes(classes, probs))
-            else:
-                # Without class labels, treat "non-first class" as risk-like.
-                score = float(1.0 - probs[0])
-
-            return ModelOutput(score=score, confidence=confidence)
-
-        if hasattr(model, "predict"):
-            pred = model.predict([text])[0]
-            # If model only predicts a class, return a coarse score.
-            # You can refine this once you know your classes.
-            pred_s = str(pred)
-            if pred_s in DEFAULT_CLASS_RISK_SCORE:
-                score = float(DEFAULT_CLASS_RISK_SCORE[pred_s])
-                confidence = 1.0
-            else:
-                score = 1.0 if pred_s in {"1", "true", "True", "pos", "positive", "high"} else 0.0
-                confidence = 1.0
-            return ModelOutput(score=score, confidence=confidence)
-
-        return None
-
-    def _pick_positive_probability(self, model: Any, proba: np.ndarray) -> float:
-        # Try to select a "positive" class index if possible; otherwise fall back to the last column.
-        classes = getattr(model, "classes_", None)
-        if classes is None:
-            return float(proba[-1])
-
+    def predict(self, text: str):
         try:
-            classes_list = [str(c) for c in list(classes)]
-        except Exception:
-            return float(proba[-1])
+            self.load_model()
 
-        for key in ("1", "pos", "positive", "high"):
-            if key in classes_list:
-                return float(proba[classes_list.index(key)])
+            inputs = self._tokenizer(
+                text,
+                return_tensors="pt",
+                truncation=True,
+                padding=True,
+                max_length=128
+            )
 
-        return float(proba[-1])
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-    def _safe_classes_list(self, classes: Any) -> list[str] | None:
-        if classes is None:
-            return None
-        try:
-            out = [str(c) for c in list(classes)]
-            return out if out else None
-        except Exception:
-            return None
+            with torch.no_grad():
+                outputs = self._model(**inputs)
+                probs = torch.softmax(outputs.logits, dim=1).cpu().numpy()[0]
 
-    def _risk_score_from_classes(self, classes: list[str], probs: np.ndarray) -> float:
-        weights = np.asarray([DEFAULT_CLASS_RISK_SCORE.get(c, 0.5) for c in classes], dtype=float)
-        score = float(np.dot(probs.astype(float), weights))
-        # Clip to [0..1]
-        return float(max(0.0, min(1.0, score)))
+            idx = int(probs.argmax())
+            label = LABELS[idx]
 
-    def _softmax(self, x: np.ndarray) -> np.ndarray:
-        x = np.asarray(x, dtype=float)
-        x = x - np.max(x)
-        ex = np.exp(x)
-        s = ex.sum()
-        if s <= 0:
-            return np.ones_like(ex) / float(ex.size)
-        return ex / s
+            return {
+                "label": label,
+                "confidence": float(probs[idx]),
+                "score": float(RISK_MAP[label])
+            }
 
-
-def load_env_models_dir() -> str:
-    return os.getenv("MODELS_DIR", "./models").strip() or "./models"
-
-
-def load_env_default_version() -> str:
-    return os.getenv("DEFAULT_MODEL_VERSION", "baseline").strip() or "baseline"
-
+        except Exception as e:
+            print("🔥 ERROR:", str(e))
+            raise e
